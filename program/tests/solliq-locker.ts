@@ -1,211 +1,138 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { SolliqLocker } from "../target/types/solliq_locker";
-import {
-  TOKEN_PROGRAM_ID,
-  createMint,
-  createAccount,
-  mintTo,
-  getAccount,
-} from "@solana/spl-token";
-import { PublicKey, Keypair, SystemProgram, SYSVAR_RENT_PUBKEY } from "@solana/web3.js";
+import { PublicKey, Keypair, SystemProgram } from '@solana/web3.js';
+import { TOKEN_PROGRAM_ID, createMint, createAccount, mintTo } from "@solana/spl-token";
 import { assert } from "chai";
-
-// Helper function to retry operations
-async function retry<T>(
-  operation: () => Promise<T>,
-  maxRetries: number = 3,
-  delay: number = 1000
-): Promise<T> {
-  let lastError;
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      return await operation();
-    } catch (error) {
-      console.log(`Attempt ${i + 1} failed:`, error);
-      lastError = error;
-      if (i < maxRetries - 1) {
-        await new Promise(resolve => setTimeout(resolve, delay));
-      }
-    }
-  }
-  throw lastError;
-}
 
 describe("solliq-locker", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 
   const program = anchor.workspace.SolliqLocker as Program<SolliqLocker>;
-  const wallet = provider.wallet as anchor.Wallet;
-  
-  let mint: PublicKey;
-  let tokenAccount: PublicKey;
-  let lockerAccount: Keypair;
-  let uniqueSeed: Keypair;
-  
+  const wallet = (provider.wallet as any).payer as Keypair;
+
+  let mockLpTokenMint: PublicKey;
+  let mockRaydiumPool: Keypair;
+  let userTokenAccount: PublicKey;
+
   before(async () => {
-    try {
-      console.log("Creating new mint...");
-      // Create a new mint with retry
-      mint = await retry(async () => {
-        return await createMint(
-          provider.connection,
-          wallet.payer,
-          wallet.publicKey,
-          null,
-          6
-        );
-      });
-      console.log("Mint created:", mint.toBase58());
-
-      console.log("Creating token account...");
-      // Create token account with retry
-      tokenAccount = await retry(async () => {
-        return await createAccount(
-          provider.connection,
-          wallet.payer,
-          mint,
-          wallet.publicKey
-        );
-      });
-      console.log("Token account created:", tokenAccount.toBase58());
-
-      console.log("Minting tokens...");
-      // Mint tokens with retry
-      await retry(async () => {
-        await mintTo(
-          provider.connection,
-          wallet.payer,
-          mint,
-          tokenAccount,
-          wallet.payer,
-          1000000
-        );
-      });
-      console.log("Tokens minted successfully");
-
-      // Initialize unique components
-      lockerAccount = Keypair.generate();
-      uniqueSeed = Keypair.generate();
-      console.log("Test setup completed successfully");
-    } catch (error) {
-      console.error("Error in test setup:", error);
-      throw error;
-    }
-  });
-
-  it("Locks tokens", async () => {
-    const lockDuration = new anchor.BN(5); // 5 seconds lock
-
-    // Create the PDA for token account
-    const [tokenVault] = await PublicKey.findProgramAddress(
-      [Buffer.from("token-seed"), lockerAccount.publicKey.toBuffer()],
-      program.programId
+    // Create mock LP token mint
+    mockLpTokenMint = await createMint(
+      provider.connection,
+      wallet,
+      wallet.publicKey,
+      null,
+      9
     );
-    console.log("Token vault PDA:", tokenVault.toBase58());
 
-    try {
-      console.log("Attempting to lock tokens...");
-      const tx = await retry(async () => {
-        return await program.methods
-          .lockTokens(uniqueSeed.publicKey, lockDuration)
-          .accounts({
-            locker: lockerAccount.publicKey,
-            tokenMint: mint,
-            tokenFrom: tokenAccount,
-            tokenVault: tokenVault,
-            owner: wallet.publicKey,
-            systemProgram: SystemProgram.programId,
-            tokenProgram: TOKEN_PROGRAM_ID,
-            rent: SYSVAR_RENT_PUBKEY,
-          })
-          .signers([lockerAccount, uniqueSeed])
-          .rpc();
-      });
+    // Create user token account
+    userTokenAccount = await createAccount(
+      provider.connection,
+      wallet,
+      mockLpTokenMint,
+      wallet.publicKey
+    );
 
-      console.log("Lock transaction signature:", tx);
+    // Mint some tokens to user
+    await mintTo(
+      provider.connection,
+      wallet,
+      mockLpTokenMint,
+      userTokenAccount,
+      wallet,
+      1000000000 // 1 token with 9 decimals
+    );
 
-      // Verify the tokens were locked with retry
-      const vaultAccount = await retry(async () => {
-        return await getAccount(provider.connection, tokenVault);
-      });
-      
-      assert.ok(vaultAccount.amount > 0, "Vault should contain tokens");
-      console.log("Tokens locked successfully");
+    // Create mock Raydium pool
+    mockRaydiumPool = Keypair.generate();
+    const createPoolIx = SystemProgram.createAccount({
+      fromPubkey: wallet.publicKey,
+      newAccountPubkey: mockRaydiumPool.publicKey,
+      lamports: await provider.connection.getMinimumBalanceForRentExemption(200),
+      space: 200,
+      programId: new PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
+    });
 
-    } catch (error) {
-      console.error("Error in locking tokens:", error);
-      throw error;
-    }
+    const tx = new anchor.web3.Transaction().add(createPoolIx);
+    await provider.sendAndConfirm(tx, [mockRaydiumPool]);
   });
 
-  it("Fails to unlock tokens before lock duration", async () => {
-    const [tokenVault] = await PublicKey.findProgramAddress(
-      [Buffer.from("token-seed"), lockerAccount.publicKey.toBuffer()],
+  it("Initializes a locker", async () => {
+    const uniqueSeed = Keypair.generate().publicKey;
+    const amount = new anchor.BN(100000000); // 0.1 token
+    const duration = new anchor.BN(7 * 24 * 60 * 60); // 7 days in seconds
+
+    const [lockerPda] = await PublicKey.findProgramAddress(
+      [
+        Buffer.from("locker"),
+        wallet.publicKey.toBuffer(),
+        mockLpTokenMint.toBuffer(),
+        uniqueSeed.toBuffer(),
+      ],
       program.programId
     );
 
-    try {
-      console.log("Attempting to unlock tokens before duration (should fail)...");
-      await program.methods
-        .unlockTokens()
-        .accounts({
-          locker: lockerAccount.publicKey,
-          tokenVault: tokenVault,
-          tokenDestination: tokenAccount,
-          owner: wallet.publicKey,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .signers([uniqueSeed])
-        .rpc();
-
-      assert.fail("Should have failed to unlock tokens");
-    } catch (error: any) {
-      console.log("Expected error when trying to unlock too early:", error.message);
-    }
-  });
-
-  it("Successfully unlocks tokens after lock duration", async () => {
-    const [tokenVault] = await PublicKey.findProgramAddress(
-      [Buffer.from("token-seed"), lockerAccount.publicKey.toBuffer()],
+    const [lockerTokenAccount] = await PublicKey.findProgramAddress(
+      [Buffer.from("token_account"), lockerPda.toBuffer()],
       program.programId
     );
 
-    console.log("Waiting for lock duration to pass...");
-    // Wait for lock duration to pass
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+    await program.methods
+      .initializeLocker(duration, amount)
+      .accounts({
+        locker: lockerPda,
+        owner: wallet.publicKey,
+        tokenMint: mockLpTokenMint,
+        ownerTokenAccount: userTokenAccount,
+        lockerTokenAccount,
+        raydiumPool: mockRaydiumPool.publicKey,
+        uniqueSeed: uniqueSeed,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
 
-    try {
-      console.log("Attempting to unlock tokens...");
-      const tx = await retry(async () => {
-        return await program.methods
-          .unlockTokens()
-          .accounts({
-            locker: lockerAccount.publicKey,
-            tokenVault: tokenVault,
-            tokenDestination: tokenAccount,
-            owner: wallet.publicKey,
-            tokenProgram: TOKEN_PROGRAM_ID,
-          })
-          .signers([uniqueSeed])
-          .rpc();
-      });
+    const lockerAccount = await program.account.locker.fetch(lockerPda);
+    assert.ok(lockerAccount.owner.equals(wallet.publicKey));
+    assert.ok(lockerAccount.tokenMint.equals(mockLpTokenMint));
+    assert.ok(lockerAccount.amount.eq(amount));
+    assert.ok(!lockerAccount.unlocked);
+  });
 
-      console.log("Unlock transaction signature:", tx);
+  it("Claims fees from a locker", async () => {
+    // Get the first locker for the wallet
+    const lockers = await program.account.locker.all([
+      {
+        memcmp: {
+          offset: 8, // Discriminator
+          bytes: wallet.publicKey.toBase58(),
+        },
+      },
+    ]);
 
-      // Verify the tokens were returned with retry
-      const vaultAccount = await retry(async () => {
-        return await getAccount(provider.connection, tokenVault)
-          .catch(() => null);
-      });
-      
-      assert.ok(!vaultAccount, "Token vault should be closed");
-      console.log("Tokens unlocked successfully");
+    const locker = lockers[0];
+    assert.ok(locker, "No locker found");
 
-    } catch (error) {
-      console.error("Error in unlocking tokens:", error);
-      throw error;
-    }
+    const [lockerTokenAccount] = await PublicKey.findProgramAddress(
+      [Buffer.from("token_account"), locker.publicKey.toBuffer()],
+      program.programId
+    );
+
+    await program.methods
+      .claimFees()
+      .accounts({
+        locker: locker.publicKey,
+        owner: wallet.publicKey,
+        tokenMint: mockLpTokenMint,
+        ownerTokenAccount: userTokenAccount,
+        lockerTokenAccount,
+        raydiumPool: mockRaydiumPool.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    const updatedLocker = await program.account.locker.fetch(locker.publicKey);
+    assert.ok(updatedLocker.lastFeeClaim.gt(locker.account.lastFeeClaim));
   });
 });
